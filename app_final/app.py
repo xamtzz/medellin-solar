@@ -210,6 +210,9 @@ def main():
                 df_cat_plot['Energía MWh/año'] = df_cat_plot['energia_total'] / 1000  # Convertir a MWh
                 df_cat_plot = df_cat_plot.rename(columns={'categoria': 'Categoría de Techo', 'cantidad': 'Cantidad de Edificaciones'})
                 
+                # Convertir la columna categórica a string para evitar problemas de serialización en Vega-Lite/Streamlit
+                df_cat_plot['Categoría de Techo'] = df_cat_plot['Categoría de Techo'].astype(str)
+                
                 # Intentar usar Plotly, si no st.bar_chart nativo
                 try:
                     import plotly.express as px
@@ -224,7 +227,8 @@ def main():
                     fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10), height=320)
                     st.plotly_chart(fig, use_container_width=True)
                 except Exception:
-                    st.bar_chart(df_cat_plot.set_index('Categoría de Techo')['Energía MWh/año'])
+                    # Usar st.bar_chart con parámetros x e y explícitos sobre el DataFrame con strings
+                    st.bar_chart(df_cat_plot, x='Categoría de Techo', y='Energía MWh/año')
                     
             with col_text:
                 st.subheader("💡 Interpretación")
