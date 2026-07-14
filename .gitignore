@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Ignorar todas las carpetas del proyecto original de Medellín
+datos/
+resultados/
+notebooks/
+papers/
+Comunas/
+scratch/
+Medellín*
+
+# Ignorar archivos pesados o irrelevantes
+*.tif
+*.gpkg
+*.geojson
+*.zip
+*.csv
+*.rdf
+*.qgz
+*.png
+*.pptx
+scratch_crs.py
+check_tif.py
+
+# =======================================
+# EXCEPCIONES: Lo único que SÍ se subirá
+# =======================================
+!app_final/
+!app_final/app.py
+!.streamlit/
+!.streamlit/config.toml
