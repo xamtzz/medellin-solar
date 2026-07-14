@@ -153,6 +153,99 @@ def main():
             col2.metric("Energía Total (kWh/año)", f"{polygons['energia_anual_kwh'].sum():,.0f}")
             col3.metric("Promedio por Techo (kWh/año)", f"{polygons['energia_anual_kwh'].mean():,.0f}")
             
+            # --- SECCIÓN DE RESUMEN E INTERPRETACIÓN ---
+            st.write("---")
+            st.subheader("🌱 Impacto Social y Ambiental Estimado")
+            
+            # Métricas agregadas
+            energia_total = polygons['energia_anual_kwh'].sum()
+            area_total = polygons['area_m2'].sum()
+            shadow_mean = polygons['shadow_factor'].mean()
+            
+            # Consumo residencial promedio en Medellín es de aprox 170 kWh/mes (2040 kWh/año)
+            hogares = energia_total / 2040
+            # Factor de emisión de CO2 para el SIN de Colombia (aprox 0.126 kg CO2/kWh de la UPME)
+            co2 = (energia_total * 0.126) / 1000
+            
+            col_imp1, col_imp2, col_imp3 = st.columns(3)
+            with col_imp1:
+                st.info(f"**🏠 Hogares Equivalentes:**\n\n~**{hogares:,.0f}** hogares podrían cubrir su consumo eléctrico anual (basado en un consumo promedio de 170 kWh/mes).")
+            with col_imp2:
+                st.success(f"**🍃 CO₂ Evitado:**\n\n~**{co2:,.1f}** toneladas de CO₂ evitadas al año (factor de emisión UPME para Colombia de 0.126 kg CO₂/kWh).")
+            with col_imp3:
+                st.warning(f"**🌤️ Impacto de Sombras:**\n\nLas sombras reducen el potencial en un **{(1 - shadow_mean)*100:.1f}%** promedio en este escenario (efectividad real: **{shadow_mean*100:.1f}%**).")
+                
+            st.write("---")
+            col_chart, col_text = st.columns([2, 1])
+            
+            with col_chart:
+                st.subheader("📊 Potencial por Tamaño de Techo")
+                
+                # Clasificación de techos según tamaño
+                def categorizar_techo(area):
+                    if area < 50:
+                        return '1. Pequeño (<50 m²)'
+                    elif area < 150:
+                        return '2. Mediano (50-150 m²)'
+                    elif area < 500:
+                        return '3. Grande (150-500 m²)'
+                    else:
+                        return '4. Industrial/Inst. (>500 m²)'
+                
+                # Convertir a Categorical para mantener el orden natural de las categorías
+                order = ['1. Pequeño (<50 m²)', '2. Mediano (50-150 m²)', '3. Grande (150-500 m²)', '4. Industrial/Inst. (>500 m²)']
+                polygons['categoria'] = pd.Categorical(
+                    polygons['area_m2'].apply(categorizar_techo),
+                    categories=order,
+                    ordered=True
+                )
+                
+                # Agrupación por categoría (se mantienen todas gracias a observed=False)
+                df_cat = polygons.groupby('categoria', observed=False).agg(
+                    energia_total=('energia_anual_kwh', 'sum'),
+                    cantidad=('geometry', 'count')
+                ).reset_index()
+                
+                df_cat_plot = df_cat.copy()
+                df_cat_plot['Energía MWh/año'] = df_cat_plot['energia_total'] / 1000  # Convertir a MWh
+                df_cat_plot = df_cat_plot.rename(columns={'categoria': 'Categoría de Techo', 'cantidad': 'Cantidad de Edificaciones'})
+                
+                # Intentar usar Plotly, si no st.bar_chart nativo
+                try:
+                    import plotly.express as px
+                    fig = px.bar(
+                        df_cat_plot, 
+                        x='Categoría de Techo', 
+                        y='Energía MWh/año',
+                        color='Categoría de Techo',
+                        hover_data=['Cantidad de Edificaciones'],
+                        color_discrete_sequence=px.colors.qualitative.Pastel
+                    )
+                    fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10), height=320)
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception:
+                    st.bar_chart(df_cat_plot.set_index('Categoría de Techo')['Energía MWh/año'])
+                    
+            with col_text:
+                st.subheader("💡 Interpretación")
+                if not df_cat.empty:
+                    max_cat_row = df_cat.loc[df_cat['energia_total'].idxmax()]
+                    max_cat_name = max_cat_row['categoria']
+                    max_cat_energy = max_cat_row['energia_total'] / 1000  # MWh
+                    max_cat_pct = (max_cat_row['energia_total'] / energia_total) * 100 if energia_total > 0 else 0
+                    
+                    st.markdown(f"""
+                    Analizando los techos de **{selected_barrio}**:
+                    
+                    * **Mayor Aporte:** Los techos **{max_cat_name[3:]}** representan la mayor oportunidad de generación, aportando **{max_cat_energy:,.1f} MWh/año** (el **{max_cat_pct:.1f}%** del total del barrio).
+                    * **Área Aprovechable:** Se analizó un área acumulada de techos de **{area_total:,.0f} m²**.
+                    * **Configuración Solar:** Con paneles al **{efficiency*100:.0f}%** de eficiencia y generación específica de **{pvgis_yield:,.1f} kWh/kWp/año**, Medellín puede avanzar hacia la descentralización de su matriz energética.
+                    """)
+                else:
+                    st.write("No hay datos disponibles para el análisis detallado.")
+                    
+            st.write("---")
+            
             # Map
             st.subheader("Mapa de Potencial Fotovoltaico")
             
