@@ -13,7 +13,7 @@ env.bak/
 venv.bak/
 
 # Ignorar todas las carpetas del proyecto original de Medellín
-datos/
+datos/*
 resultados/
 notebooks/
 papers/
@@ -41,3 +41,6 @@ check_tif.py
 !app_final/app.py
 !.streamlit/
 !.streamlit/config.toml
+!datos/barrios_y_veredas_limpio.geojson
+!datos/poligonosmedellin_fotovoltaico.gpkg
+!medellin_techo_sombra_2026_*.tif
