@@ -6,12 +6,17 @@ from streamlit_folium import st_folium
 import rasterio
 from rasterio.mask import mask
 import os
+import base64
+from io import BytesIO
 import numpy as np
+from PIL import Image
+from rasterio.enums import Resampling
+from rasterio.warp import calculate_default_transform, reproject
 from shapely.geometry import box
 
 st.set_page_config(page_title="Potencial Fotovoltaico Medellín", page_icon="☀️", layout="wide")
 
-st.title("☀️ Visualizador de Potencial Fotovoltaico en Medellín")
+st.title(" Visualizador de Potencial Fotovoltaico en Medellín")
 st.markdown("Calcula y visualiza el potencial fotovoltaico en techos, considerando el factor de sombra.")
 
 @st.cache_data
@@ -89,6 +94,51 @@ def calculate_shadows(polys, tif_path):
     polys['shadow_factor'] = shadow_factors
     return polys
 
+@st.cache_data
+def load_city_shadow_overlay(tif_path, max_size=1400):
+    """Convierte el raster de sombras a una capa PNG ligera para Folium."""
+    with rasterio.open(tif_path) as src:
+        src_data = src.read(1)
+        valid = src_data != src.nodata if src.nodata is not None else np.ones(src_data.shape, dtype=bool)
+        sun_pixels = int(np.count_nonzero((src_data == 0) & valid))
+        shadow_pixels = int(np.count_nonzero((src_data == 1) & valid))
+
+        transform, default_width, default_height = calculate_default_transform(
+            src.crs, "EPSG:4326", src.width, src.height, *src.bounds
+        )
+        scale = min(1.0, max_size / max(default_width, default_height))
+        width = max(1, int(default_width * scale))
+        height = max(1, int(default_height * scale))
+        transform = transform * transform.scale(
+            default_width / width, default_height / height
+        )
+
+        projected = np.full((height, width), 255, dtype=np.uint8)
+        reproject(
+            source=src_data,
+            destination=projected,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=src.nodata,
+            dst_transform=transform,
+            dst_crs="EPSG:4326",
+            dst_nodata=255,
+            resampling=Resampling.nearest,
+        )
+
+        rgba = np.zeros((height, width, 4), dtype=np.uint8)
+        rgba[projected == 0] = [30, 170, 80, 210]
+        rgba[projected == 1] = [220, 55, 45, 220]
+        image_buffer = BytesIO()
+        Image.fromarray(rgba, mode="RGBA").save(image_buffer, format="PNG", optimize=True)
+        image_url = "data:image/png;base64," + base64.b64encode(image_buffer.getvalue()).decode("ascii")
+
+        west = transform.c
+        north = transform.f
+        east = west + transform.a * width
+        south = north + transform.e * height
+        return image_url, [[south, west], [north, east]], sun_pixels, shadow_pixels
+
 def main():
     barrios_gdf = load_barrios()
     
@@ -101,7 +151,11 @@ def main():
             name_col = name_cols[0] if name_cols else barrios_gdf.columns[0]
             
             barrio_list = sorted(barrios_gdf[name_col].dropna().unique())
-            selected_barrio = st.selectbox("Selecciona un Barrio/Vereda", barrio_list)
+            selected_barrio = st.selectbox(
+                "Selecciona una vista",
+                ["Todo Medellín"] + barrio_list,
+                help="Elige Todo Medellín para ver la ciudad completa o un barrio/vereda para analizar sus techos."
+            )
         else:
             st.error("No se pudo cargar el archivo de barrios.")
             selected_barrio = None
@@ -118,6 +172,89 @@ def main():
         hour_str = "08h" if "08" in hora_sel else "12h" if "12" in hora_sel else "16h"
         tif_filename = f"medellin_techo_sombra_2026_{date_str}_{hour_str}.tif"
         tif_path = os.path.join(".", tif_filename)
+
+    if selected_barrio == "Todo Medellín" and barrios_gdf is not None:
+        st.write("### Vista general de Medellín")
+        st.caption("La capa muestra los píxeles de techo con sol y sombra para la fecha y hora seleccionadas.")
+
+        barrios_map = barrios_gdf.copy()
+        if barrios_map.crs and barrios_map.crs.to_epsg() != 4326:
+            barrios_map = barrios_map.to_crs(epsg=4326)
+
+        city_bounds = barrios_map.total_bounds
+        city_center = barrios_map.geometry.union_all().centroid
+        m = folium.Map(
+            location=[city_center.y, city_center.x],
+            zoom_start=11,
+            tiles="CartoDB positron"
+        )
+
+        if os.path.exists(tif_path):
+            with st.spinner("Preparando la capa de sombras de Medellín..."):
+                overlay_url, overlay_bounds, sun_pixels, shadow_pixels = load_city_shadow_overlay(tif_path)
+            folium.raster_layers.ImageOverlay(
+                image=overlay_url,
+                bounds=overlay_bounds,
+                name="Sol y sombra en techos",
+                opacity=0.82,
+                interactive=True,
+                cross_origin=False,
+                zindex=2,
+            ).add_to(m)
+
+            roof_pixels = sun_pixels + shadow_pixels
+            sun_pct = (sun_pixels / roof_pixels * 100) if roof_pixels else 0
+            shadow_pct = (shadow_pixels / roof_pixels * 100) if roof_pixels else 0
+            metric1, metric2, metric3 = st.columns(3)
+            metric1.metric("Cobertura con sol", f"{sun_pct:.1f}%")
+            metric2.metric("Cobertura con sombra", f"{shadow_pct:.1f}%")
+            metric3.metric("Píxeles de techo analizados", f"{roof_pixels:,}")
+
+            legend = """
+            <div style="position: fixed; bottom: 35px; left: 55px; z-index: 9999;
+                        background: white; padding: 10px 14px; border: 1px solid #777;
+                        border-radius: 4px; font-size: 14px;">
+              <b>Condición del techo</b><br>
+              <span style="color:#1eaa50; font-size:20px;">■</span> Con sol<br>
+              <span style="color:#dc372d; font-size:20px;">■</span> Con sombra
+            </div>
+            """
+            m.get_root().html.add_child(folium.Element(legend))
+
+        folium.GeoJson(
+            barrios_map[[name_col, "geometry"]].to_json(),
+            name="Barrios y veredas",
+            style_function=lambda feature: {
+                "fillColor": "transparent",
+                "color": "#333333",
+                "weight": 0.8,
+                "fillOpacity": 0,
+            },
+            highlight_function=lambda feature: {
+                "fillColor": "#ffd166",
+                "color": "#111111",
+                "weight": 2,
+                "fillOpacity": 0.45,
+            },
+            tooltip=folium.GeoJsonTooltip(
+                fields=[name_col],
+                aliases=["Barrio/Vereda:"]
+            ),
+        ).add_to(m)
+
+        m.fit_bounds([
+            [city_bounds[1], city_bounds[0]],
+            [city_bounds[3], city_bounds[2]],
+        ])
+        folium.LayerControl(collapsed=False).add_to(m)
+        st_folium(
+            m,
+            width=1200,
+            height=650,
+            returned_objects=[],
+            key="map_todo_medellin",
+        )
+        return
 
     if selected_barrio and barrios_gdf is not None:
         # Get the geometry of the selected barrio
@@ -155,31 +292,31 @@ def main():
             
             # --- SECCIÓN DE RESUMEN E INTERPRETACIÓN ---
             st.write("---")
-            st.subheader("🌱 Impacto Social y Ambiental Estimado")
+            st.subheader(" Impacto Social y Ambiental Estimado")
             
             # Métricas agregadas
             energia_total = polygons['energia_anual_kwh'].sum()
             area_total = polygons['area_m2'].sum()
             shadow_mean = polygons['shadow_factor'].mean()
             
-            # Consumo residencial promedio en Medellín es de aprox 170 kWh/mes (2040 kWh/año)
-            hogares = energia_total / 2040
-            # Factor de emisión de CO2 para el SIN de Colombia (aprox 0.126 kg CO2/kWh de la UPME)
-            co2 = (energia_total * 0.126) / 1000
+            # Consumo residencial promedio en Medellín es de aprox 130 kWh/mes (1560 kWh/año)
+            hogares = energia_total / 1560
+            # Factor de emisión de CO2 para el SIN de Colombia (aprox 0.097 kg CO2/kWh de la UPME)
+            co2 = (energia_total * 0.097) / 1000
             
             col_imp1, col_imp2, col_imp3 = st.columns(3)
             with col_imp1:
-                st.info(f"**🏠 Hogares Equivalentes:**\n\n~**{hogares:,.0f}** hogares podrían cubrir su consumo eléctrico anual (basado en un consumo promedio de 170 kWh/mes).")
+                st.info(f"Hogares Equivalentes:\n\n~**{hogares:,.0f}** hogares podrían cubrir su consumo eléctrico anual (basado en un consumo promedio de 130 kWh/mes).")
             with col_imp2:
-                st.success(f"**🍃 CO₂ Evitado:**\n\n~**{co2:,.1f}** toneladas de CO₂ evitadas al año (factor de emisión UPME para Colombia de 0.126 kg CO₂/kWh).")
+                st.success(f"CO₂ Evitado:\n\n~**{co2:,.1f}** toneladas de CO₂ evitadas al año (factor de emisión UPME para Colombia de 0.097 kg CO₂/kWh).")
             with col_imp3:
-                st.warning(f"**🌤️ Impacto de Sombras:**\n\nLas sombras reducen el potencial en un **{(1 - shadow_mean)*100:.1f}%** promedio en este escenario (efectividad real: **{shadow_mean*100:.1f}%**).")
+                st.warning(f"Impacto de Sombras:\n\nLas sombras reducen el potencial en un **{(1 - shadow_mean)*100:.1f}%** promedio en este escenario (efectividad real: **{shadow_mean*100:.1f}%**).")
                 
             st.write("---")
             col_chart, col_text = st.columns([2, 1])
             
             with col_chart:
-                st.subheader("📊 Potencial por Tamaño de Techo")
+                st.subheader("Potencial por Tamaño de Techo")
                 
                 # Clasificación de techos según tamaño
                 def categorizar_techo(area):
@@ -231,7 +368,7 @@ def main():
                     st.bar_chart(df_cat_plot, x='Categoría de Techo', y='Energía MWh/año')
                     
             with col_text:
-                st.subheader("💡 Interpretación")
+                st.subheader("Interpretación")
                 if not df_cat.empty:
                     max_cat_row = df_cat.loc[df_cat['energia_total'].idxmax()]
                     max_cat_name = max_cat_row['categoria']
