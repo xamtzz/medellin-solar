@@ -82,10 +82,9 @@ def calculate_shadows(polys, tif_path):
                     valid_data = valid_data[valid_data != src.nodata]
                 
                 if valid_data.size > 0:
-                    # Si el TIF tiene 1 como sombra y 0 como sol, el factor de radiación sería 1 - mean
-                    # Asumiremos que mean_val es el factor (0 a 1). Ajustable según el TIF real.
-                    mean_val = np.mean(valid_data)
-                    shadow_factors.append(mean_val)
+                    # En estos TIFF: 1 = sombra y 0 = iluminado.
+                    shadow_fraction = np.mean(valid_data)
+                    shadow_factors.append(1 - shadow_fraction)
                 else:
                     shadow_factors.append(0.8)
             except Exception:
@@ -95,13 +94,37 @@ def calculate_shadows(polys, tif_path):
     return polys
 
 @st.cache_data
+def calculate_zone_shadow_stats(tif_path, _zone_geom, _zone_crs):
+    """Calcula sol y sombra por píxel dentro del límite exacto de la zona."""
+    with rasterio.open(tif_path) as src:
+        geom = _zone_geom
+        if _zone_crs and src.crs and _zone_crs != src.crs:
+            geom = gpd.GeoSeries([geom], crs=_zone_crs).to_crs(src.crs).iloc[0]
+
+        zone_data = mask(src, [geom], crop=True)[0][0]
+        valid = zone_data != src.nodata if src.nodata is not None else np.ones(zone_data.shape, dtype=bool)
+        shadow_pixels = int(np.count_nonzero((zone_data == 1) & valid))
+        sun_pixels = int(np.count_nonzero((zone_data == 0) & valid))
+        total_pixels = sun_pixels + shadow_pixels
+
+        if total_pixels == 0:
+            return None
+        return {
+            "sun_pct": sun_pixels / total_pixels * 100,
+            "shadow_pct": shadow_pixels / total_pixels * 100,
+            "total_pixels": total_pixels,
+        }
+
+@st.cache_data
 def load_city_shadow_overlay(tif_path, max_size=1400):
     """Convierte el raster de sombras a una capa PNG ligera para Folium."""
     with rasterio.open(tif_path) as src:
         src_data = src.read(1)
         valid = src_data != src.nodata if src.nodata is not None else np.ones(src_data.shape, dtype=bool)
+        # En estos TIFF: 1 = sombra y 0 = iluminado.
         sun_pixels = int(np.count_nonzero((src_data == 0) & valid))
         shadow_pixels = int(np.count_nonzero((src_data == 1) & valid))
+        pixel_area_m2 = abs(src.transform.a * src.transform.e - src.transform.b * src.transform.d)
 
         transform, default_width, default_height = calculate_default_transform(
             src.crs, "EPSG:4326", src.width, src.height, *src.bounds
@@ -137,7 +160,7 @@ def load_city_shadow_overlay(tif_path, max_size=1400):
         north = transform.f
         east = west + transform.a * width
         south = north + transform.e * height
-        return image_url, [[south, west], [north, east]], sun_pixels, shadow_pixels
+        return image_url, [[south, west], [north, east]], sun_pixels, shadow_pixels, pixel_area_m2
 
 def main():
     barrios_gdf = load_barrios()
@@ -191,7 +214,7 @@ def main():
 
         if os.path.exists(tif_path):
             with st.spinner("Preparando la capa de sombras de Medellín..."):
-                overlay_url, overlay_bounds, sun_pixels, shadow_pixels = load_city_shadow_overlay(tif_path)
+                overlay_url, overlay_bounds, sun_pixels, shadow_pixels, pixel_area_m2 = load_city_shadow_overlay(tif_path)
             folium.raster_layers.ImageOverlay(
                 image=overlay_url,
                 bounds=overlay_bounds,
@@ -209,6 +232,34 @@ def main():
             metric1.metric("Cobertura con sol", f"{sun_pct:.1f}%")
             metric2.metric("Cobertura con sombra", f"{shadow_pct:.1f}%")
             metric3.metric("Píxeles de techo analizados", f"{roof_pixels:,}")
+
+            # Usa los mismos supuestos del análisis individual por barrio.
+            roof_area_m2 = roof_pixels * pixel_area_m2
+            effective_solar_factor = sun_pixels / roof_pixels if roof_pixels else 0
+            city_energy_kwh = roof_area_m2 * efficiency * pvgis_yield * effective_solar_factor
+            city_homes = city_energy_kwh / 1560
+            city_co2_tons = city_energy_kwh * 0.097 / 1000
+
+            st.write("---")
+            st.subheader("Impacto Social y Ambiental Estimado")
+            impact1, impact2, impact3 = st.columns(3)
+            with impact1:
+                st.info(
+                    f"Hogares Equivalentes:\n\n~**{city_homes:,.0f}** hogares podrían cubrir "
+                    "su consumo eléctrico anual (basado en un consumo promedio de 130 kWh/mes)."
+                )
+            with impact2:
+                st.success(
+                    f"CO₂ Evitado:\n\n~**{city_co2_tons:,.1f}** toneladas de CO₂ evitadas "
+                    "al año (factor de emisión UPME para Colombia de 0.097 kg CO₂/kWh)."
+                )
+            with impact3:
+                st.warning(
+                    f"Impacto de Sombras:\n\nLas sombras reducen el potencial en un "
+                    f"**{shadow_pct:.1f}%** promedio en este escenario "
+                    f"(efectividad real: **{sun_pct:.1f}%**)."
+                )
+            st.write("---")
 
             legend = """
             <div style="position: fixed; bottom: 35px; left: 55px; z-index: 9999;
@@ -297,7 +348,19 @@ def main():
             # Métricas agregadas
             energia_total = polygons['energia_anual_kwh'].sum()
             area_total = polygons['area_m2'].sum()
-            shadow_mean = polygons['shadow_factor'].mean()
+            zone_shadow_stats = calculate_zone_shadow_stats(
+                tif_path, barrio_geom, barrios_gdf.crs
+            )
+            if zone_shadow_stats:
+                shadow_pct_zone = zone_shadow_stats['shadow_pct']
+                solar_pct_zone = zone_shadow_stats['sun_pct']
+            else:
+                # Respaldo ponderado por área si el raster no contiene píxeles válidos.
+                solar_factor = np.average(
+                    polygons['shadow_factor'], weights=polygons['area_m2']
+                ) if area_total > 0 else 0
+                solar_pct_zone = solar_factor * 100
+                shadow_pct_zone = (1 - solar_factor) * 100
             
             # Consumo residencial promedio en Medellín es de aprox 130 kWh/mes (1560 kWh/año)
             hogares = energia_total / 1560
@@ -310,7 +373,7 @@ def main():
             with col_imp2:
                 st.success(f"CO₂ Evitado:\n\n~**{co2:,.1f}** toneladas de CO₂ evitadas al año (factor de emisión UPME para Colombia de 0.097 kg CO₂/kWh).")
             with col_imp3:
-                st.warning(f"Impacto de Sombras:\n\nLas sombras reducen el potencial en un **{(1 - shadow_mean)*100:.1f}%** promedio en este escenario (efectividad real: **{shadow_mean*100:.1f}%**).")
+                st.warning(f"Impacto de Sombras:\n\nLas sombras cubren un **{shadow_pct_zone:.1f}%** de los píxeles de techo en este escenario (superficie iluminada: **{solar_pct_zone:.1f}%**).")
                 
             st.write("---")
             col_chart, col_text = st.columns([2, 1])
